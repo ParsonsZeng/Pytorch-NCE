@@ -34,7 +34,7 @@ class RNNModel(nn.Module):
 
     def forward(self, sentences, length, lr=1):
 
-        emb_gpu = transfer(self.encoder(sentences), 0)
+        emb_gpu = transfer(self.encoder(sentences), None)
         mask = get_mask(length.data, max_len=sentences.size(1) - 1)
         input_emb = emb_gpu[:, :-1].contiguous()
         target_emb = emb_gpu[:, 1:].contiguous()

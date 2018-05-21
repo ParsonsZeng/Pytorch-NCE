@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.autograd as autograd
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 import data
 from model import RNNModel
@@ -27,12 +29,6 @@ logger.info(args)
 
 # Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
-if torch.cuda.is_available():
-    if not args.cuda:
-        logger.warning('You have a CUDA device, so you should probably run with --cuda')
-    else:
-        torch.cuda.manual_seed(args.seed)
-
 #################################################################
 # Load data
 #################################################################
@@ -57,8 +53,6 @@ logger.info('Vocabulary size is {}'.format(ntoken))
 noise = build_unigram_noise(
     torch.FloatTensor(corpus.train.dataset.vocab.idx2count)
 )
-if args.cuda:
-    noise = noise.cuda()
 
 # setting up NCELoss modules
 if args.index_module == 'linear':
@@ -92,16 +86,14 @@ else:
     logger.error('The index module [%s] is not supported yet' % args.index_module)
     raise(NotImplementedError('index module not supported'))
 
-if args.cuda:
-    model.cuda()
-
 logger.info('model definition:\n %s', model)
 #################################################################
 # Training code
 #################################################################
 
-model.encoder = model.encoder.cpu()
+dense_params = [model.criterion.bias] + list(model.rnn.parameters())
 model.criterion.emb = model.encoder  # test tying weight
+model.encoder.share_memory()
 
 def train(model, data_source, epoch, lr=1.0, weight_decay=1e-5, momentum=0.9):
     optimizer = optim.SGD(
@@ -129,8 +121,7 @@ def train(model, data_source, epoch, lr=1.0, weight_decay=1e-5, momentum=0.9):
             print(p)
 
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
-        torch.nn.utils.clip_grad_norm(model.rnn.parameters(), args.clip)
-        torch.nn.utils.clip_grad_norm([model.criterion.bias], args.clip)
+        torch.nn.utils.clip_grad_norm(dense_params, args.clip)
         optimizer.step()
         emb_grad = model.encoder.weight.grad.coalesce()
         indices = emb_grad._indices().view(-1)
@@ -145,6 +136,9 @@ def train(model, data_source, epoch, lr=1.0, weight_decay=1e-5, momentum=0.9):
         if args.prof:
             break
         if num_batch % args.log_interval == 0 and num_batch > 0:
+            for param in dense_params:
+                dist.all_reduce(param.data, op=dist.reduce_op.SUM)
+                param.data /= dist.get_world_size()
             cur_loss = total_loss / args.log_interval
             ppl = math.exp(cur_loss)
             logger.debug(
@@ -179,7 +173,8 @@ def evaluate(model, data_source, cuda=args.cuda):
     return math.exp(eval_loss/total_length)
 
 
-def run_epoch(epoch, lr, best_val_ppl):
+torch.backends.cudnn.enabled = False
+def run_epoch(model, epoch, lr, best_val_ppl):
     """A training epoch includes training, evaluation and logging"""
     epoch_start_time = time.time()
     train(model, corpus.train, epoch=epoch, lr=lr, weight_decay=args.weight_decay)
@@ -204,16 +199,27 @@ def run_epoch(epoch, lr, best_val_ppl):
         # Anneal the learning rate if no improvement has been seen in the
         # validation dataset.
         lr /= args.lr_decay
-    return lr, best_val_ppl
+    return model, lr, best_val_ppl
 
-if __name__ == '__main__':
+WORLD_SIZE = 2
+
+def main(model):
+    dist.init_process_group('nccl', world_size=WORLD_SIZE, init_method='file:///tmp/shared_tile')
+    torch.cuda.set_device(dist.get_rank())
+    if dist.get_rank() == 0:
+        return
     lr = args.lr
     best_val_ppl = None
+    if args.cuda:
+        for p in dense_params:
+            p.data = p.data.cuda()
+        model.criterion.noise = model.criterion.noise.cuda()
+        model.criterion.to_cuda()
     if args.train:
         # At any point you can hit Ctrl + C to break out of training early.
         try:
             for epoch in range(1, args.epochs + 1):
-                lr, best_val_ppl = run_epoch(epoch, lr, best_val_ppl)
+                model, lr, best_val_ppl = run_epoch(model, epoch, lr, best_val_ppl)
                 if args.prof:
                     break
         except KeyboardInterrupt:
@@ -229,3 +235,12 @@ if __name__ == '__main__':
         test_ppl = evaluate(model, corpus.test)
         logger.warning('| End of training | test ppl {:8.2f}'.format(test_ppl))
         sys.stdout.flush()
+
+if __name__ == '__main__':
+    processes = []
+    for rank in range(WORLD_SIZE):
+        p = mp.Process(target=main, args=(model,))
+        p.start()
+        processes.append(p)
+    for p in processes:
+        p.join()

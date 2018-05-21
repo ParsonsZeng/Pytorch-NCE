@@ -5,6 +5,7 @@ import os
 import torch
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.dataloader import DataLoader
+import torch.distributed as dist
 from tqdm import tqdm
 
 from vocab import get_vocab
@@ -57,13 +58,17 @@ class LMDataset(Dataset):
         self.data = sentences
 
     def __getitem__(self, index):
+        length = len(self.data)
+        offset = length * dist.get_rank() // dist.get_world_size()
+        index += offset
         raw_sentence = self.data[index]
         # truncate the sequence length to maximum of BPTT
         sentence = ['<s>'] + raw_sentence.split()[:self.bptt] + ['</s>']
         return [self.vocab.word2idx[word] for word in sentence]
 
     def __len__(self):
-        return len(self.data)
+        return len(self.data) // dist.get_world_size()
+
 
 
 class ContLMDataset(LMDataset):
