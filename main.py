@@ -173,7 +173,6 @@ def evaluate(model, data_source, cuda=args.cuda):
     return math.exp(eval_loss/total_length)
 
 
-torch.backends.cudnn.enabled = False
 def run_epoch(model, epoch, lr, best_val_ppl):
     """A training epoch includes training, evaluation and logging"""
     epoch_start_time = time.time()
@@ -206,8 +205,6 @@ WORLD_SIZE = 2
 def main(model):
     dist.init_process_group('nccl', world_size=WORLD_SIZE, init_method='file:///tmp/shared_tile')
     torch.cuda.set_device(dist.get_rank())
-    if dist.get_rank() == 0:
-        return
     lr = args.lr
     best_val_ppl = None
     if args.cuda:
