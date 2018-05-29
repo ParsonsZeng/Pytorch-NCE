@@ -95,7 +95,7 @@ dense_params = [model.criterion.bias] + list(model.rnn.parameters())
 model.criterion.emb = model.encoder  # test tying weight
 model.encoder.share_memory()
 
-def train(model, data_source, epoch, lr=1.0, weight_decay=1e-5, momentum=0.9):
+def train(lock, model, data_source, epoch, lr=1.0, weight_decay=1e-5, momentum=0.9):
     optimizer = optim.SGD(
         params=model.rnn.parameters(),
         lr=lr,
@@ -110,6 +110,10 @@ def train(model, data_source, epoch, lr=1.0, weight_decay=1e-5, momentum=0.9):
     total_loss = 0
     pbar = tqdm(data_source, desc='Training PPL: ....')
     for num_batch, data_batch in enumerate(pbar):
+        for param in dense_params:
+            dist.all_reduce(param.data, op=dist.reduce_op.SUM)
+            param.data /= dist.get_world_size()
+
         optimizer.zero_grad()
         if model.encoder.weight.grad is not None:
             model.encoder.weight.grad.zero_()
@@ -125,20 +129,24 @@ def train(model, data_source, epoch, lr=1.0, weight_decay=1e-5, momentum=0.9):
         optimizer.step()
         emb_grad = model.encoder.weight.grad.coalesce()
         indices = emb_grad._indices().view(-1)
-        w_d = weight_decay * model.encoder.weight.data[indices]
-        emb_grad._values().add_(w_d)
-        # model.encoder.weight.data.add_(-lr * emb_grad)
-        model.encoder.weight.data.index_add_(0, indices, -lr * emb_grad._values())
+        values = emb_grad._values()
 
+        # norm clipping is critical for preventing nan at optimizing
+        norm = values.norm()
+        emb_clip = 1
+        if norm > emb_clip:
+            values.mul_(emb_clip / norm)
+        # model.encoder.weight.data.add_(-lr * emb_grad)
+        with lock:
+            w_d = weight_decay * model.encoder.weight.data[indices]
+            values.add_(w_d)
+            model.encoder.weight.data.index_add_(0, indices, -lr * emb_grad._values())
 
         total_loss += loss.data[0]
 
         if args.prof:
             break
         if num_batch % args.log_interval == 0 and num_batch > 0:
-            for param in dense_params:
-                dist.all_reduce(param.data, op=dist.reduce_op.SUM)
-                param.data /= dist.get_world_size()
             cur_loss = total_loss / args.log_interval
             ppl = math.exp(cur_loss)
             logger.debug(
@@ -154,7 +162,7 @@ def train(model, data_source, epoch, lr=1.0, weight_decay=1e-5, momentum=0.9):
 def evaluate(model, data_source, cuda=args.cuda):
     # Turn on evaluation mode which disables dropout.
     model.eval()
-    model.criterion.nce = False
+    #model.criterion.nce = False
 
     eval_loss = 0
     total_length = 0
@@ -170,13 +178,14 @@ def evaluate(model, data_source, cuda=args.cuda):
 
     model.criterion.nce = True
 
+    return eval_loss / total_length
     return math.exp(eval_loss/total_length)
 
 
-def run_epoch(model, epoch, lr, best_val_ppl):
+def run_epoch(lock, model, epoch, lr, best_val_ppl):
     """A training epoch includes training, evaluation and logging"""
     epoch_start_time = time.time()
-    train(model, corpus.train, epoch=epoch, lr=lr, weight_decay=args.weight_decay)
+    train(lock, model, corpus.train, epoch=epoch, lr=lr, weight_decay=args.weight_decay)
     if args.prof:
         return
     val_ppl = evaluate(model, corpus.valid)
@@ -187,24 +196,30 @@ def run_epoch(model, epoch, lr, best_val_ppl):
             (time.time() - epoch_start_time),
             val_ppl)
     )
+    def torch_save(*args):
+        if dist.get_rank == 0:
+            torch.save(*args)
+
     with open(args.save+'.epoch_{}'.format(epoch), 'wb') as f:
-        torch.save(model, f)
+        torch_save(model, f)
     # Save the model if the validation loss is the best we've seen so far.
     if not best_val_ppl or val_ppl < best_val_ppl:
         with open(args.save, 'wb') as f:
-            torch.save(model, f)
+            torch_save(model, f)
         best_val_ppl = val_ppl
     else:
         # Anneal the learning rate if no improvement has been seen in the
         # validation dataset.
-        lr /= args.lr_decay
+        if epoch >= 5:
+            lr /= args.lr_decay
     return model, lr, best_val_ppl
 
-WORLD_SIZE = 2
+WORLD_SIZE = 4
 
-def main(model):
+def main(model, lock):
     dist.init_process_group('nccl', world_size=WORLD_SIZE, init_method='file:///tmp/shared_tile')
     torch.cuda.set_device(dist.get_rank())
+    torch.manual_seed(1123)
     lr = args.lr
     best_val_ppl = None
     if args.cuda:
@@ -216,7 +231,7 @@ def main(model):
         # At any point you can hit Ctrl + C to break out of training early.
         try:
             for epoch in range(1, args.epochs + 1):
-                model, lr, best_val_ppl = run_epoch(model, epoch, lr, best_val_ppl)
+                model, lr, best_val_ppl = run_epoch(lock, model, epoch, lr, best_val_ppl)
                 if args.prof:
                     break
         except KeyboardInterrupt:
@@ -235,8 +250,9 @@ def main(model):
 
 if __name__ == '__main__':
     processes = []
+    lock = mp.Lock()
     for rank in range(WORLD_SIZE):
-        p = mp.Process(target=main, args=(model,))
+        p = mp.Process(target=main, args=(model, lock))
         p.start()
         processes.append(p)
     for p in processes:
