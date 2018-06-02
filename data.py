@@ -96,11 +96,14 @@ class ContLMDataset(LMDataset):
         self.data = concated_seq.split()
 
     def __getitem__(self, index):
+        length = len(self.data) // self.bptt
+        offset = length * dist.get_rank() // dist.get_world_size()
+        index += offset
         sentence = self.data[index * self.bptt:(index + 1) * self.bptt]
         return [self.vocab.word2idx[word] for word in sentence]
 
     def __len__(self):
-        return len(self.data) // self.bptt
+        return len(self.data) // self.bptt // dist.get_world_size()
 
 
 def pad_collate_fn(batch):
