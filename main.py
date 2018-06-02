@@ -108,25 +108,38 @@ def train(lock, model, data_source, epoch, lr=1.0, weight_decay=1e-5, momentum=0
     model.train()
     model.criterion.nce = args.nce
     total_loss = 0
-    pbar = tqdm(data_source, desc='Training PPL: ....')
+    pbar = tqdm(data_source, desc='Training PPL: ....', disable=(not dist.get_rank() == 0))
     for num_batch, data_batch in enumerate(pbar):
-        for param in dense_params:
-            dist.all_reduce(param.data, op=dist.reduce_op.SUM)
-            param.data /= dist.get_world_size()
-
+        data, target, length = process_data(data_batch, cuda=False, sep_target=False)
+        # warming-up
         optimizer.zero_grad()
         if model.encoder.weight.grad is not None:
             model.encoder.weight.grad.zero_()
-        data, target, length = process_data(data_batch, cuda=False, sep_target=False)
-        loss = model(data, length.cuda(), lr)
         with torch.autograd.profiler.profile(enabled=args.prof, use_cuda=True) as p:
+            loss = model(data, length.cuda(), lr)
             loss.backward()
         if args.prof:
-            print(p)
+            if dist.get_rank() == 0:
+                print(p)
 
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
         torch.nn.utils.clip_grad_norm(dense_params, args.clip)
         optimizer.step()
+
+        for param in dense_params:
+            dist.all_reduce(param.data, op=dist.reduce_op.SUM)
+            param.data.div_(dist.get_world_size())
+
+        if False and num_batch == 400:
+            print('rank {} finished computing gradient: {}'.format(dist.get_rank(), time.time()))
+            torch.cuda.synchronize()
+            print('rank {} started all reduce at: {}'.format(dist.get_rank(), time.time()))
+            for param in dense_params:
+                dist.all_reduce(param.data, op=dist.reduce_op.SUM)
+                param.data.div_(dist.get_world_size())
+            torch.cuda.synchronize()
+            print('rank {} completed all reduce at: {}'.format(dist.get_rank(), time.time()))
+
         emb_grad = model.encoder.weight.grad.coalesce()
         indices = emb_grad._indices().view(-1)
         values = emb_grad._values()
@@ -162,7 +175,7 @@ def train(lock, model, data_source, epoch, lr=1.0, weight_decay=1e-5, momentum=0
 def evaluate(model, data_source, cuda=args.cuda):
     # Turn on evaluation mode which disables dropout.
     model.eval()
-    #model.criterion.nce = False
+    model.criterion.nce = False
 
     eval_loss = 0
     total_length = 0
@@ -178,7 +191,7 @@ def evaluate(model, data_source, cuda=args.cuda):
 
     model.criterion.nce = True
 
-    return eval_loss / total_length
+    # return eval_loss / total_length
     return math.exp(eval_loss/total_length)
 
 
